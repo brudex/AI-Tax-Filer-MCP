@@ -148,11 +148,21 @@ export class DocumentParser {
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'application/vnd.ms-excel',
-      'text/csv'
+      'text/csv',
+      'application/csv',
+      'text/plain',
+      'application/octet-stream' // For files that can't be detected properly
     ];
     const maxSize = 10 * 1024 * 1024; // 10MB
 
-    if (!allowedTypes.includes(file.mimetype)) {
+    // For octet-stream, validate by file extension instead
+    if (file.mimetype === 'application/octet-stream') {
+      const extension = file.originalname.toLowerCase().split('.').pop();
+      const allowedExtensions = ['pdf', 'docx', 'xlsx', 'xls', 'csv'];
+      if (!extension || !allowedExtensions.includes(extension)) {
+        throw new Error(`Invalid file type. Allowed types: PDF, DOCX, XLSX, CSV`);
+      }
+    } else if (!allowedTypes.includes(file.mimetype)) {
       throw new Error(`Invalid file type. Allowed types: PDF, DOCX, XLSX, CSV`);
     }
 

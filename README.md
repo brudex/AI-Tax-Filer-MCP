@@ -165,7 +165,7 @@ curl http://localhost:3000/api/ai-status
 ```bash
 curl -X POST \
   -F "document=@financial_statement.pdf" \
-  http://localhost:3000/api/upload
+  http://localhost:3000/api/documents/upload
 ```
 
 2. **Check processing status:**

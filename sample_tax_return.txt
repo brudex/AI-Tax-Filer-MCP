@@ -1,0 +1,59 @@
+GHANA REVENUE AUTHORITY
+ANNUAL TAX RETURN - 2023
+===============================
+
+TAXPAYER INFORMATION
+-------------------
+Taxpayer Name: Kwame Mensah Enterprises
+TIN: P0054398271
+Business Type: Sole Proprietorship
+Contact: +233 24 555 7890
+Email: kwame.mensah@business.com
+
+FINANCIAL SUMMARY
+----------------
+Reporting Period: January 1, 2023 - December 31, 2023
+
+Income:
+1. Business Income:          GHS 450,000.00
+2. Investment Income:        GHS 25,000.00
+3. Rental Income:           GHS 36,000.00
+-----------------------------------
+Total Income:               GHS 511,000.00
+
+Expenses:
+1. Operating Costs:         GHS 180,000.00
+2. Employee Salaries:       GHS 95,000.00
+3. Utilities:              GHS 24,000.00
+4. Rent:                   GHS 36,000.00
+5. Marketing:              GHS 15,000.00
+-----------------------------------
+Total Expenses:            GHS 350,000.00
+
+Deductions:
+1. Capital Allowances:     GHS 25,000.00
+2. Charitable Donations:   GHS 10,000.00
+3. Pension Contributions:  GHS 12,000.00
+-----------------------------------
+Total Deductions:          GHS 47,000.00
+
+TAX CALCULATION
+--------------
+Gross Income:              GHS 511,000.00
+Less: Total Expenses:     (GHS 350,000.00)
+Less: Total Deductions:   (GHS 47,000.00)
+===================================
+Taxable Amount:            GHS 114,000.00
+
+DECLARATION
+----------
+I declare that the information provided in this tax return is true, correct, and complete.
+
+Signature: _________________
+Date: December 31, 2023
+
+FOR OFFICIAL USE ONLY
+-------------------
+Received By: _______________
+Date: ___________________
+Office: Accra Central GRA 

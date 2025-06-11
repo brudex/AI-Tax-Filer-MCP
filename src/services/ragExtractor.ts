@@ -7,7 +7,7 @@ import { Document } from '@langchain/core/documents';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 
-// Add these interfaces at the top of the file after the imports
+// Utility Types
 interface FinancialStatementItem {
   Account: string;
   Amount?: number;
@@ -51,6 +51,199 @@ interface EnhancedExtractedTaxData extends ExtractedTaxData {
   validationData?: ValidationData;
 }
 
+// Utility Functions
+const cleanJSONString = (content: string): string => {
+  try {
+    let cleaned = content.trim();
+    
+    // If content doesn't start with {, find the first {
+    const firstBrace = cleaned.indexOf('{');
+    if (firstBrace > 0) {
+      cleaned = cleaned.slice(firstBrace);
+    }
+    
+    // If content doesn't end with }, find the last }
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (lastBrace !== -1 && lastBrace < cleaned.length - 1) {
+      cleaned = cleaned.slice(0, lastBrace + 1);
+    }
+
+    // Remove markdown code blocks
+    cleaned = cleaned.replace(/```(?:json)?\s*|\s*```/g, '');
+    
+    // Remove comments (both // and /* */)
+    cleaned = cleaned.replace(/\/\/[^\n]*/g, ''); // Remove single line comments
+    cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, ''); // Remove multi-line comments
+    
+    // Fix common JSON formatting issues
+    cleaned = cleaned
+      // Remove trailing commas in objects and arrays
+      .replace(/,(\s*[}\]])/g, '$1')
+      // Ensure property names are double-quoted
+      .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
+      // Fix missing quotes around string values
+      .replace(/:\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2')
+      // Remove any remaining newlines and extra spaces
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Validate JSON structure
+    if (!cleaned.startsWith('{') || !cleaned.endsWith('}')) {
+      throw new Error('Invalid JSON structure');
+    }
+
+    return cleaned;
+  } catch (error) {
+    console.warn('Error in cleanJSONString:', error);
+    throw error;
+  }
+};
+
+const safeJSONParse = (content: string): any => {
+  try {
+    // First try direct parsing
+    return JSON.parse(content);
+  } catch (error) {
+    console.warn('Initial JSON parse failed, attempting cleanup...');
+    
+    try {
+      // Try parsing after cleaning
+      const cleaned = cleanJSONString(content);
+      return JSON.parse(cleaned);
+    } catch (error) {
+      console.warn('Cleaned JSON parse failed, attempting rescue parsing...');
+      
+      try {
+        // Last resort: aggressive cleaning
+        let rescued = content
+          .replace(/[^\x20-\x7E]/g, '') // Remove non-printable characters
+          .replace(/\s+/g, ' ') // Normalize whitespace
+          .replace(/,\s*([}\]])/g, '$1') // Remove trailing commas
+          .replace(/([a-zA-Z0-9_]+):/g, '"$1":') // Quote unquoted keys
+          .replace(/:\s*'([^']*?)'\s*([,}])/g, ':"$1"$2') // Replace single quotes with double quotes
+          .replace(/:\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2'); // Quote unquoted string values
+        
+        // Extract JSON object if embedded in other text
+        const match = rescued.match(/{[\s\S]*}/);
+        if (match) {
+          rescued = match[0];
+        }
+        
+        return JSON.parse(rescued);
+      } catch (finalError) {
+        console.error('All JSON parsing attempts failed:', finalError);
+        throw new Error('Failed to parse JSON after multiple attempts');
+      }
+    }
+  }
+};
+
+const parseAmount = (match: RegExpMatchArray | null): number => {
+  if (!match || !match[1]) return 0;
+  const numStr = match[1].replace(/,/g, '');
+  if (numStr.includes('(') && numStr.includes(')')) {
+    return -parseFloat(numStr.replace(/[()]/g, ''));
+  }
+  return parseFloat(numStr);
+};
+
+const extractYearFromText = (text: string): number => {
+  const yearMatch = text.match(/(?:20\d{2})/);
+  return yearMatch ? parseInt(yearMatch[0], 10) : new Date().getFullYear();
+};
+
+const extractCompanyInfo = (text: string): { name: string; type: string } => {
+  let name = "Not provided";
+  let type = "Not provided";
+
+  const lines = text.split('\n');
+  
+  // Look for company name patterns
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine && /\b\w+.*LIMITED\b/i.test(trimmedLine)) {
+      name = trimmedLine;
+      const words = trimmedLine.split(' ');
+      const limitedIndex = words.findIndex(w => /LIMITED/i.test(w));
+      if (limitedIndex > 0) {
+        type = words.slice(0, limitedIndex).join(' ').trim();
+      }
+      break;
+    }
+  }
+
+  // Try alternative patterns if needed
+  if (name === "Not provided") {
+    const companyPattern = /^([A-Z][A-Z\s&]+(?:COMPANY|LIMITED|LTD|INC|CORP))/m;
+    const match = text.match(companyPattern);
+    if (match) {
+      name = match[1].trim();
+      if (/TECHNOLOGY|TECH|SOFTWARE|IT/i.test(name)) {
+        type = "Technology";
+      } else if (/TRADING|TRADE/i.test(name)) {
+        type = "Trading";
+      } else if (/CONSTRUCTION|BUILD/i.test(name)) {
+        type = "Construction";
+      }
+    }
+  }
+
+  return { name, type };
+};
+
+const getDefaultTaxData = (): ExtractedTaxData => ({
+  taxpayerName: 'Not provided',
+  taxYear: new Date().getFullYear(),
+  totalIncome: 0,
+  totalExpenses: 0,
+  totalDeductions: 0,
+  taxableAmount: 0,
+  taxId: 'Not provided',
+  businessType: 'Not specified'
+});
+
+const validateNumericValue = (value: any): number => {
+  if (typeof value !== 'number' || isNaN(value) || !isFinite(value)) {
+    return 0;
+  }
+  return value;
+};
+
+const validateExpensesRatio = (expenses: number, income: number): number => {
+  const MAX_EXPENSE_RATIO = 5; // 500% of revenue
+  if (income > 0 && expenses > income * 3) {
+    return Math.min(expenses, income * MAX_EXPENSE_RATIO);
+  }
+  return expenses;
+};
+
+const validateTaxableAmount = (
+  taxableAmount: number,
+  calculatedTaxable: number,
+  totalIncome: number
+): { 
+  value: number;
+  warning?: string;
+} => {
+  const taxableDifference = Math.abs(calculatedTaxable - taxableAmount);
+  const significantDifference = Math.max(1000, totalIncome * 0.1);
+  
+  if (taxableDifference > significantDifference) {
+    if (taxableAmount === 0 && calculatedTaxable !== 0) {
+      return {
+        value: calculatedTaxable,
+        warning: `Taxable amount corrected to calculated value: ${calculatedTaxable}`
+      };
+    }
+    return {
+      value: taxableAmount,
+      warning: 'Taxable amount differs significantly from calculated value'
+    };
+  }
+  
+  return { value: taxableAmount };
+};
+
 export class RAGExtractor {
   private llm: Ollama | null = null;
   private openai: OpenAI | null = null;
@@ -65,123 +258,15 @@ export class RAGExtractor {
   }
 
   /**
-   * Initialize all AI providers
+   * Initialize all AI providers with enhanced error handling
    */
   async initialize(): Promise<void> {
     try {
-      // Initialize Ollama
-      if (config.ai.ollama.enabled) {
-        try {
-          // Initialize Ollama embeddings with timeout
-          let embeddingsInstance: OllamaEmbeddings | null = null;
-          try {
-            embeddingsInstance = new OllamaEmbeddings({
-              model: config.ai.ollama.model,
-              baseUrl: config.ai.ollama.baseUrl
-            });
-
-            // Test embeddings with timeout
-            const embeddingsPromise = embeddingsInstance.embedQuery("Test embeddings");
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error('Ollama embeddings timeout')), 5000);
-            });
-
-            await Promise.race([embeddingsPromise, timeoutPromise]);
-            
-            // Only set the instance variables after successful test
-            this.embeddings = embeddingsInstance;
-            this.vectorStore = new MemoryVectorStore(this.embeddings);
-            console.log('✅ Ollama embeddings initialized successfully');
-          } catch (error) {
-            console.warn('⚠️  Failed to initialize Ollama embeddings:', error instanceof Error ? error.message : String(error));
-            console.warn('   Is Ollama running? Try starting it with: ollama serve');
-            embeddingsInstance = null;
-            this.embeddings = null;
-            this.vectorStore = null;
-          }
-
-          // Initialize Ollama LLM
-          let llmInstance: Ollama | null = null;
-          try {
-            console.log('🔄 Creating Ollama LLM instance...');
-            llmInstance = new Ollama({
-          baseUrl: config.ai.ollama.baseUrl,
-          model: config.ai.ollama.model,
-              temperature: 0.1, // Add low temperature for more deterministic responses
-        });
-        
-            // Test Ollama LLM connection with timeout
-            console.log('🔄 Testing Ollama LLM connection...');
-            const testPromise = llmInstance.invoke("hi");
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error('Ollama LLM timeout')), 15000);
-            });
-            
-            try {
-              const testResponse = await Promise.race([testPromise, timeoutPromise]);
-              console.log('🔄 Ollama LLM test response:', testResponse);
-        if (testResponse) {
-                // Only set the instance variable after successful test
-                this.llm = llmInstance;
-                this.availableProviders.push('ollama');
-                console.log('✅ Ollama LLM initialized successfully');
-              }
-            } catch (error) {
-              console.warn('⚠️  Failed to connect to Ollama LLM:', error instanceof Error ? error.message : String(error));
-              console.warn('   Is Ollama running? Try starting it with: ollama serve');
-              if (error instanceof Error && error.stack) {
-                console.warn('   Stack trace:', error.stack);
-              }
-              llmInstance = null;
-              this.llm = null;
-            }
-
-            // If both embeddings and LLM failed, clean up
-            if (!this.embeddings && !this.llm) {
-              console.warn('⚠️  Both Ollama embeddings and LLM failed to initialize');
-              this.embeddings = null;
-              this.vectorStore = null;
-              this.llm = null;
-            }
-          } catch (error) {
-            console.warn('⚠️  Failed to initialize Ollama:', error instanceof Error ? error.message : String(error));
-            this.llm = null;
-            this.embeddings = null;
-            this.vectorStore = null;
-        }
-        } catch (error) {
-          console.warn('⚠️  Failed to initialize Ollama:', error instanceof Error ? error.message : String(error));
-          this.llm = null;
-          this.embeddings = null;
-          this.vectorStore = null;
-        }
-      }
-
-      // Initialize OpenAI
-      if (config.ai.openai.enabled && config.ai.openai.apiKey) {
-        try {
-          this.openai = new OpenAI({
-            apiKey: config.ai.openai.apiKey,
-          });
-          this.availableProviders.push('openai');
-          console.log('✅ OpenAI initialized successfully');
-        } catch (error) {
-          console.warn('⚠️  Failed to initialize OpenAI:', error);
-        }
-      }
-
-      // Initialize Claude
-      if (config.ai.claude.enabled && config.ai.claude.apiKey) {
-        try {
-          this.claude = new Anthropic({
-            apiKey: config.ai.claude.apiKey,
-          });
-          this.availableProviders.push('claude');
-          console.log('✅ Claude initialized successfully');
-        } catch (error) {
-          console.warn('⚠️  Failed to initialize Claude:', error);
-        }
-      }
+      await Promise.all([
+        this.initializeOllama(),
+        this.initializeOpenAI(),
+        this.initializeClaude()
+      ]);
 
       if (this.availableProviders.length === 0) {
         console.warn('⚠️  No AI providers available. AI extraction will be disabled.');
@@ -195,11 +280,248 @@ export class RAGExtractor {
   }
 
   /**
+   * Initialize Ollama provider and embeddings
+   */
+  private async initializeOllama(): Promise<void> {
+    if (!config.ai.ollama.enabled) return;
+
+    try {
+      // Initialize Ollama embeddings
+      const embeddingsInstance = await this.initializeOllamaEmbeddings();
+      if (embeddingsInstance) {
+        this.embeddings = embeddingsInstance;
+        this.vectorStore = new MemoryVectorStore(this.embeddings);
+        console.log('✅ Ollama embeddings initialized successfully');
+      }
+
+      // Initialize Ollama LLM
+      const llmInstance = await this.initializeOllamaLLM();
+      if (llmInstance) {
+        this.llm = llmInstance;
+        this.availableProviders.push('ollama');
+        console.log('✅ Ollama LLM initialized successfully');
+      }
+    } catch (error) {
+      console.warn('⚠️  Failed to initialize Ollama:', error);
+      this.cleanupOllamaResources();
+    }
+  }
+
+  /**
+   * Initialize Ollama embeddings with timeout
+   */
+  private async initializeOllamaEmbeddings(): Promise<OllamaEmbeddings | null> {
+    try {
+      const embeddingsInstance = new OllamaEmbeddings({
+        model: config.ai.ollama.model,
+        baseUrl: config.ai.ollama.baseUrl
+      });
+
+      // Test embeddings with timeout
+      const embeddingsPromise = embeddingsInstance.embedQuery("Test embeddings");
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Ollama embeddings timeout')), 5000);
+      });
+
+      await Promise.race([embeddingsPromise, timeoutPromise]);
+      return embeddingsInstance;
+    } catch (error) {
+      console.warn('⚠️  Failed to initialize Ollama embeddings:', error);
+      console.warn('   Is Ollama running? Try starting it with: ollama serve');
+      return null;
+    }
+  }
+
+  /**
+   * Initialize Ollama LLM with timeout
+   */
+  private async initializeOllamaLLM(): Promise<Ollama | null> {
+    try {
+      console.log('🔄 Creating Ollama LLM instance...');
+      const llmInstance = new Ollama({
+        baseUrl: config.ai.ollama.baseUrl,
+        model: config.ai.ollama.model,
+        temperature: 0.1
+      });
+
+      // Test LLM with timeout
+      console.log('🔄 Testing Ollama LLM connection...');
+      const testPromise = llmInstance.invoke("Test connection");
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Ollama LLM timeout')), 15000);
+      });
+
+      const testResponse = await Promise.race([testPromise, timeoutPromise]);
+      console.log('🔄 Ollama LLM test response:', testResponse);
+
+      return testResponse ? llmInstance : null;
+    } catch (error) {
+      console.warn('⚠️  Failed to initialize Ollama LLM:', error);
+      console.warn('   Is Ollama running? Try starting it with: ollama serve');
+      if (error instanceof Error && error.stack) {
+        console.warn('   Stack trace:', error.stack);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Clean up Ollama resources on failure
+   */
+  private cleanupOllamaResources(): void {
+    this.llm = null;
+    this.embeddings = null;
+    this.vectorStore = null;
+  }
+
+  /**
+   * Initialize OpenAI provider
+   */
+  private async initializeOpenAI(): Promise<void> {
+    if (!config.ai.openai.enabled || !config.ai.openai.apiKey) return;
+
+    try {
+      this.openai = new OpenAI({
+        apiKey: config.ai.openai.apiKey,
+      });
+      
+      // Test connection
+      const response = await this.openai.chat.completions.create({
+        model: config.ai.openai.model,
+        messages: [{ role: 'user', content: 'Test connection' }],
+        max_tokens: 50
+      });
+
+      if (response) {
+        this.availableProviders.push('openai');
+        console.log('✅ OpenAI initialized successfully');
+      }
+    } catch (error) {
+      console.warn('⚠️  Failed to initialize OpenAI:', error);
+      this.openai = null;
+    }
+  }
+
+  /**
+   * Initialize Claude provider
+   */
+  private async initializeClaude(): Promise<void> {
+    if (!config.ai.claude.enabled || !config.ai.claude.apiKey) return;
+
+    try {
+      this.claude = new Anthropic({
+        apiKey: config.ai.claude.apiKey,
+      });
+
+      // Test connection
+      const response = await this.claude.messages.create({
+        model: config.ai.claude.model,
+        max_tokens: 50,
+        messages: [
+          {
+            role: 'user',
+            content: 'Test connection'
+          }
+        ]
+      });
+
+      if (response) {
+        this.availableProviders.push('claude');
+        console.log('✅ Claude initialized successfully');
+      }
+    } catch (error) {
+      console.warn('⚠️  Failed to initialize Claude:', error);
+      this.claude = null;
+    }
+  }
+
+  /**
+   * Get providers to try based on preference
+   */
+  private getProvidersToTry(): string[] {
+    if (this.availableProviders.includes(this.preferredProvider)) {
+      return [
+        this.preferredProvider,
+        ...this.availableProviders.filter(p => p !== this.preferredProvider)
+      ];
+    }
+    return this.availableProviders;
+  }
+
+  /**
+   * Check if AI extraction is enabled
+   */
+  isAIEnabled(): boolean {
+    return this.availableProviders.length > 0;
+  }
+
+  /**
+   * Get available AI providers
+   */
+  getAvailableProviders(): string[] {
+    return this.availableProviders;
+  }
+
+  /**
+   * Test AI provider connections
+   */
+  async testConnection(): Promise<Record<string, boolean>> {
+    const results: Record<string, boolean> = {
+      ollama: false,
+      openai: false,
+      claude: false
+    };
+
+    // Test Ollama
+    if (this.llm) {
+      try {
+        const response = await this.llm.invoke("Test connection");
+        results.ollama = !!response;
+      } catch (error) {
+        console.warn('Ollama test failed:', error);
+      }
+    }
+
+    // Test OpenAI
+    if (this.openai) {
+      try {
+        const response = await this.openai.chat.completions.create({
+          model: config.ai.openai.model,
+          messages: [{ role: 'user', content: 'Test connection' }],
+          max_tokens: 50
+        });
+        results.openai = !!response;
+      } catch (error) {
+        console.warn('OpenAI test failed:', error);
+      }
+    }
+
+    // Test Claude
+    if (this.claude) {
+      try {
+        const response = await this.claude.messages.create({
+          model: config.ai.claude.model,
+          max_tokens: 50,
+          messages: [
+            {
+              role: 'user',
+              content: 'Test connection'
+            }
+          ]
+        });
+        results.claude = !!response;
+      } catch (error) {
+        console.warn('Claude test failed:', error);
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Extract tax data using available providers
    */
   async extractTaxData(documentText: string, context: string = ''): Promise<ExtractedTaxData> {
-    console.log('extractTaxData:>>>>>>>>>>>111111', documentText);
-    console.log('context:>>>>>>>>>>>', context);
     if (this.availableProviders.length === 0) {
       return this.getDefaultTaxData();
     }
@@ -224,11 +546,7 @@ export class RAGExtractor {
     
     for (const provider of providersToTry) {
       try {
-        console.log(`🔄 Attempting extraction with ${provider}...`);
-        console.log('documentText:>>>>>>>>>>>>1111111', documentText);
         const result = await this.extractWithProvider(provider, documentText, context);
-        console.log('result>>>>>>>>>>>>>>>>', result);
-        console.log(`✅ Successfully extracted data using ${provider}`);
         return result;
       } catch (error) {
         console.warn(`❌ ${provider} extraction failed:`, error);
@@ -264,12 +582,12 @@ export class RAGExtractor {
    * Extract using Ollama
    */
   private async extractWithOllama(prompt: string, originalDocumentText: string): Promise<ExtractedTaxData> {
-    console.log('extractWithOllama:>>>>>>>>>>>333333', prompt);
     if (!this.llm) throw new Error('Ollama not initialized');
     
     const response = await this.llm.invoke(prompt);
 
-    console.log('llm response:>>>>>>>>>>>>4444444', response);
+    console.log('ollama prompt:>>>>>>>>>>>>', prompt);
+    console.log('ollama response:>>>>>>>>>>>>', response);
 
     return this.parseAIResponse(response, originalDocumentText);
   }
@@ -356,25 +674,35 @@ export class RAGExtractor {
 
       1. INCOME STATEMENT ITEMS:
          - Revenue/Sales/Turnover (exact amount from P&L)
-         - Other income (if any)
-         - Cost of sales/Cost of goods sold
-         - Gross profit
-         - Operating expenses (detailed breakdown if available)
-         - General & administrative expenses
-         - Depreciation expenses
-         - Interest expenses
-         - Profit/Loss before tax (CRITICAL - preserve sign)
-         - Income tax expense
-         - Net profit/loss after tax
+       - Other income (if any)
+       - Cost of sales/Cost of goods sold
+       - Gross profit
+       - Operating expenses (detailed breakdown if available)
+       - General & administrative expenses
+       - Depreciation expenses
+       - Interest expenses
+       - Profit/Loss before tax (CRITICAL - preserve sign)
+       - Income tax expense (split into current and deferred where possible)
+       - Net profit/loss after tax
+       - Total comprehensive income
 
       2. BALANCE SHEET ITEMS:
-         - Property, plant & equipment (net book value)
-         - Trade receivables
-         - Cash and bank balances
-         - Stated capital/Share capital
-         - Retained earnings
-         - Trade payables/creditors
-         - Current liabilities
+          - Property, plant & equipment (net book value)
+       - Trade receivables
+       - Cash and bank balances
+       - Stated capital/Share capital
+       - Retained earnings
+       - Trade payables/creditors
+       - Accruals
+       - Deferred tax assets and liabilities
+       - Current tax assets/liabilities
+       - Total current assets
+       - Total non-current assets
+       - Total assets
+       - Total current liabilities
+       - Total non-current liabilities
+       - Total liabilities
+       - Total equity
 
       3. TAX COMPUTATION ITEMS:
          - Assessable income
@@ -415,75 +743,21 @@ export class RAGExtractor {
       - Loss before tax should be negative
       - Expenses shown in parentheses are still positive expenses
 
-      REQUIRED JSON FORMAT (comprehensive Ghana tax data):
-      {
-        "taxpayerName": "Cache Technology Company Limited",
-        "taxYear": 2023,
-        "totalIncome": 13247,
-        "totalExpenses": 14927,
-        "totalDeductions": 4000,
-        "taxableAmount": -1680,
-        "taxId": "Not provided",
-        "businessType": "Technology",
-        "revenue": 13247,
-        "generalAdminExpenses": 14927,
-        "profitBeforeTax": -1680,
-        "incomeTaxExpense": 500,
-        "netProfitAfterTax": -2180,
-        "totalAssets": 8250,
-        "totalLiabilities": 11930,
-        "totalEquity": -1180,
-        "depreciation": 2000,
-        "capitalAllowances": 4000,
-        "retainedEarnings": -2180,
-        "propertyPlantEquipment": 8000,
-        "tradeReceivables": 150,
-        "cashAndBank": 100,
-        "statedCapital": 1000,
-        "tradePayables": 9930,
-        "assessableIncome": 320,
-        "chargeableIncome": -3680,
-        "deferredTax": 500,
-        "costOfSales": 0,
-        "grossProfit": 13247,
-        "operatingProfit": -1680,
-        "interestExpense": 0,
-        "otherIncome": 0,
-        "extraordinaryItems": 0,
-        "currentTaxLiability": 0,
-        "deferredTaxAsset": 0,
-        "deferredTaxLiability": 500,
-        "payeDeducted": 0,
-        "withholdingTaxDeducted": 0,
-        "vatInputTax": 0,
-        "vatOutputTax": 0,
-        "socialSecurityContributions": 0,
-        "nhisContributions": 0,
-        "getfundLevy": 0,
-        "nationalReconstructionLevy": 0,
-        "communicationServiceTax": 0,
-        "stampDuty": 0,
-        "customsDuty": 0,
-        "exciseDuty": 0,
-        "propertyTax": 0,
-        "vehicleTax": 0,
-        "businessOperatingPermit": 0,
-        "environmentalExciseTax": 0,
-        "specialImportLevy": 0,
-        "exportDevelopmentLevy": 0,
-        "energyDebtRecoveryLevy": 0,
-        "stabilisationLevy": 0,
-        "priceStabilisationRecoveryLevy": 0
-      }
+      REQUIRED JSON FORMAT:
+      - FLAT JSON object (no nested objects or arrays)
+      - If data not found, use 0 for numbers, "Not provided" for strings
+      - Each amount as a number (no quotes)
 
       EXTRACTION RULES:
-      1. Find EXACT amounts from the document - don't calculate or estimate
-      2. Preserve negative signs for losses (parentheses = negative)
-      3. FLAT JSON structure - NO nested objects or arrays
-      4. Revenue MUST be extracted correctly (13,247 from Revenue line)
-      5. Handle Ghana Cedis currency properly (remove GH¢, commas)
-      6. Convert ALL amounts to numbers, not strings
-      7. If data not found, use 0 for numbers, "Not provided" for strings
+      1. Find EXACT amounts from the document — do NOT calculate or estimate.
+      2. Extract subtotals and totals if explicitly stated (even if they're a sum of other figures).
+      3. Preserve negative signs for losses (parentheses = negative).
+      4. Revenue MUST be extracted correctly — look for "Revenue", "Sales", or "Turnover" in the Income Statement.
+      5. Handle Ghana Cedis currency properly — remove GH¢ symbols and commas.
+      6. Convert ALL amounts to numbers, not strings.
+      7. If a specific item is not found, use 0 for numbers, "Not provided" for strings.
+      8. Use a FLAT JSON structure — NO nested objects or arrays; each item as its own key-value pair.
+      9. If you are not sure about the data, use 0 for numbers, "Not provided" for strings.
 
       Additional context: ${context}
 
@@ -766,41 +1040,66 @@ export class RAGExtractor {
   }
 
   /**
-   * Apply soft constraints to ensure data quality
+   * Apply soft constraints with enhanced validation
    */
   private applySoftConstraints(data: ExtractedTaxData): ExtractedTaxData {
     const constrainedData = { ...data };
+    const warnings: string[] = [];
 
-    // Soft constraint 1: Revenue should be positive for operational companies
+    // Validate numeric fields
+    const numericFields: (keyof ExtractedTaxData)[] = [
+      'totalIncome',
+      'totalExpenses',
+      'totalDeductions',
+      'taxableAmount'
+    ];
+
+    for (const field of numericFields) {
+      const originalValue = constrainedData[field] as number;
+      const validatedValue = validateNumericValue(originalValue);
+      if (validatedValue !== originalValue) {
+        warnings.push(`Invalid numeric value for ${field}, reset to 0`);
+        (constrainedData[field] as number) = validatedValue;
+      }
+    }
+
+    // Validate revenue
     if (constrainedData.totalIncome <= 0 && constrainedData.businessType !== 'Holding Company') {
-      console.warn('⚠️  Revenue is zero or negative for operational company - this may indicate extraction error');
+      warnings.push('Revenue is zero or negative for operational company');
     }
 
-    // Soft constraint 2: Total expenses shouldn't exceed revenue by more than 200% (loss-making companies)
-    if (constrainedData.totalExpenses > constrainedData.totalIncome * 3) {
-      console.warn('⚠️  Expenses are significantly higher than revenue - verify extraction accuracy');
+    // Validate and adjust expenses if needed
+    const validatedExpenses = validateExpensesRatio(
+      constrainedData.totalExpenses,
+      constrainedData.totalIncome
+    );
+    
+    if (validatedExpenses !== constrainedData.totalExpenses) {
+      warnings.push('Expenses were capped at maximum allowed ratio to revenue');
+      constrainedData.totalExpenses = validatedExpenses;
     }
 
-    // Soft constraint 3: Taxable amount should be reasonable
-    const calculatedTaxable = constrainedData.totalIncome - constrainedData.totalExpenses - constrainedData.totalDeductions;
-    if (Math.abs(calculatedTaxable - constrainedData.taxableAmount) > Math.max(1000, constrainedData.totalIncome * 0.1)) {
-      console.warn(`⚠️  Taxable amount (${constrainedData.taxableAmount}) differs significantly from calculated value (${calculatedTaxable})`);
-      // Use calculated value if the difference is substantial
-      if (constrainedData.taxableAmount === 0 && calculatedTaxable !== 0) {
-        constrainedData.taxableAmount = calculatedTaxable;
-        console.log(`✅ Taxable amount corrected to calculated value: ${calculatedTaxable}`);
-      }
+    // Validate taxable amount
+    const calculatedTaxable = constrainedData.totalIncome - 
+                            constrainedData.totalExpenses - 
+                            constrainedData.totalDeductions;
+    
+    const { value: validatedTaxable, warning: taxableWarning } = validateTaxableAmount(
+      constrainedData.taxableAmount,
+      calculatedTaxable,
+      constrainedData.totalIncome
+    );
+
+    if (taxableWarning) {
+      warnings.push(taxableWarning);
+      constrainedData.taxableAmount = validatedTaxable;
     }
 
-    // Soft constraint 4: Ensure numeric values are reasonable
-    const numericFields: (keyof ExtractedTaxData)[] = ['totalIncome', 'totalExpenses', 'totalDeductions', 'taxableAmount'];
-    numericFields.forEach(field => {
-      const value = constrainedData[field] as number;
-      if (typeof value === 'number' && (isNaN(value) || !isFinite(value))) {
-        (constrainedData[field] as number) = 0;
-        console.warn(`⚠️  Invalid numeric value for ${field}, reset to 0`);
-      }
-    });
+    // Log all warnings
+    if (warnings.length > 0) {
+      console.warn('⚠️  Validation warnings:');
+      warnings.forEach(warning => console.warn(`  - ${warning}`));
+    }
 
     return constrainedData;
   }
@@ -821,7 +1120,9 @@ export class RAGExtractor {
    * Parse simplified AI response format
    */
   private parseSimplifiedResponse(data: any, originalDocumentText: string): ExtractedTaxData {
-    console.log('📋 Parsing simplified response format...');
+    console.log('📋 Parsing simplified response format...1');
+    console.log('data:>>>>>>>>>>>>', data);
+
     
     // Extract company details and tax year from document text
     const { companyName, businessType } = this.extractCompanyDetails(originalDocumentText);
@@ -866,51 +1167,104 @@ export class RAGExtractor {
    */
   private parseFinancialStatementFormat(data: FinancialStatementData, originalDocumentText: string): ExtractedTaxData {
     console.log('📋 Parsing financial statement format...');
+    console.log('data:>>>>>>>>>>>>9999999999999', data);
+    ///console.log('originalDocumentText:>>>>>>>>>>>>', originalDocumentText);
     
-    // Extract company details and tax year from the original document text
-    const { companyName, businessType } = this.extractCompanyDetails(originalDocumentText);
-    const taxYear = this.extractTaxYear(originalDocumentText);
+    // Extract basic info
+    const { name: companyName, type: businessType } = extractCompanyInfo(originalDocumentText);
+    const taxYear = extractYearFromText(originalDocumentText);
 
-    // Extract financial data with more flexible key detection
-    const revenue = data.Profit_and_Loss?.find(item => 
-      /revenue|income|sales|turnover/i.test(item.Account))?.Amount || 
-      data.Profit_and_Loss?.find(item => 
-        /revenue|income|sales|turnover/i.test(item.Account))?.Expenses || 0;
+    // Safely extract financial data
+    const financialData = this.extractFinancialData(data);
     
-    // Look for expenses with flexible matching and check multiple property names
-    const expensesItem = data.Profit_and_Loss?.find(item => 
-      /(?:general|administrative|operating|total).*expenses?|expenses?.*(?:general|administrative|operating|total)/i.test(item.Account));
-    const expenses = expensesItem?.Expenses || expensesItem?.Amount || expensesItem?.Cost || 0;
-    
-    const profitBeforeTax = data.Profit_and_Loss?.find(item => 
-      /profit.*before.*tax|income.*before.*tax/i.test(item.Account))?.Amount || 0;
+    console.log('📊 Financial statement extraction results:', financialData);
 
-    // Look for deductions/allowances with flexible matching
-    const deductionsItem = data.Profit_and_Loss?.find(item => 
-      /capital.*allowances?|depreciation|deductions?|tax.*relief/i.test(item.Account));
-    const deductions = deductionsItem?.Amount || deductionsItem?.Expenses || 0;
+    const result = {
+      taxpayerName: companyName,
+      taxYear: taxYear,
+      totalIncome: financialData.revenue,
+      totalExpenses: financialData.expenses,
+      totalDeductions: financialData.deductions,
+      taxableAmount: financialData.profitBeforeTax || 
+                    (financialData.revenue - financialData.expenses - financialData.deductions),
+      taxId: "Not provided",
+      businessType: businessType
+    };
 
-    // Try to get retained earnings as additional context
-    const retainedEarnings = data.Retained_Earnings?.[0]?.Retained_Earnings || 0;
+    return this.applySoftConstraints(result);
+  }
 
-    console.log('📊 Financial statement extraction results:', {
+  /**
+   * Extract financial data from statement with safe array handling
+   */
+  private extractFinancialData(data: FinancialStatementData): {
+    revenue: number;
+    expenses: number;
+    deductions: number;
+    profitBeforeTax: number;
+    retainedEarnings: number;
+  } {
+    // Ensure arrays exist
+    const profitAndLoss = Array.isArray(data.Profit_and_Loss) ? data.Profit_and_Loss : [];
+    const balanceSheet = Array.isArray(data.Balance_Sheet) ? data.Balance_Sheet : [];
+    const retainedEarningsData = Array.isArray(data.Retained_Earnings) ? data.Retained_Earnings : [];
+
+    // Extract revenue with flexible matching
+    const revenue = this.findFinancialItem(profitAndLoss, 
+      /revenue|income|sales|turnover/i,
+      ['Amount', 'Expenses', 'Total_Income']
+    );
+
+    // Extract expenses
+    const expenses = this.findFinancialItem(profitAndLoss,
+      /(?:general|administrative|operating|total).*expenses?|expenses?.*(?:general|administrative|operating|total)/i,
+      ['Expenses', 'Amount', 'Cost', 'Total_Expenses']
+    );
+
+    // Extract profit before tax
+    const profitBeforeTax = this.findFinancialItem(profitAndLoss,
+      /profit.*before.*tax|income.*before.*tax/i,
+      ['Amount']
+    );
+
+    // Extract deductions/allowances
+    const deductions = this.findFinancialItem(profitAndLoss,
+      /capital.*allowances?|depreciation|deductions?|tax.*relief/i,
+      ['Amount', 'Expenses']
+    );
+
+    // Extract retained earnings
+    const retainedEarnings = retainedEarningsData[0]?.Retained_Earnings || 0;
+
+    return {
       revenue,
       expenses,
       deductions,
       profitBeforeTax,
       retainedEarnings
-    });
-
-    return {
-      taxpayerName: companyName,
-      taxYear: taxYear,
-      totalIncome: revenue,
-      totalExpenses: expenses,
-      totalDeductions: deductions,
-      taxableAmount: profitBeforeTax || (revenue - expenses - deductions),
-      taxId: "Not provided", // Look for TIN in the data
-      businessType: businessType
     };
+  }
+
+  /**
+   * Find financial item with flexible property matching
+   */
+  private findFinancialItem(
+    items: FinancialStatementItem[],
+    accountPattern: RegExp,
+    propertyNames: string[]
+  ): number {
+    const matchingItem = items.find(item => accountPattern.test(item.Account));
+    if (!matchingItem) return 0;
+
+    // Try each property name in order
+    for (const prop of propertyNames) {
+      const value = matchingItem[prop as keyof FinancialStatementItem];
+      if (typeof value === 'number' && !isNaN(value)) {
+        return value;
+      }
+    }
+
+    return 0;
   }
 
   /**
@@ -921,7 +1275,7 @@ export class RAGExtractor {
       const lines = text.split('\n');
       for (const line of lines) {
         if (pattern.test(line)) {
-          console.log(`🔍 Analyzing line for pattern ${pattern.source}:`, line.trim());
+          console.log(` Analyzing line for pattern ${pattern.source}:`, line.trim());
           
           // Enhanced number matching with Ghana Cedis support
           const numberMatches = [
@@ -1039,151 +1393,103 @@ export class RAGExtractor {
    */
   private parseAIResponse(content: string, originalDocumentText?: string): ExtractedTaxData {
     try {
-      console.log('parseAIResponse:>>>>>>>>>>>222222', content);
-      // Clean the response to ensure it's valid JSON
-      let cleanedContent = content.trim();
+      console.log('Parsing AI response...');
       
-      // Remove markdown code blocks if present
-      cleanedContent = cleanedContent.replace(/```json\n?|\n?```/g, '');
-      
-      // Remove JavaScript-style comments that make JSON invalid
-      cleanedContent = cleanedContent.replace(/\/\/.*$/gm, ''); // Remove single-line comments
-      cleanedContent = cleanedContent.replace(/\/\*[\s\S]*?\*\//g, ''); // Remove multi-line comments
-      
-      // Remove trailing commas that might be left after removing comments
-      cleanedContent = cleanedContent.replace(/,(\s*[}\]])/g, '$1');
-      
-      // Remove any leading/trailing whitespace or newlines
-      cleanedContent = cleanedContent.trim();
-
-      // Log the cleaned content for debugging
-      console.log('Cleaned AI response (comments removed):', cleanedContent);
-
-      const extractedData = JSON.parse(cleanedContent) as FinancialStatementData | ExtractedTaxData | EnhancedExtractedTaxData;
-      console.log('Parsed data:', extractedData);
-
-      // Check if it's enhanced data with validation fields
-      if ('validationData' in extractedData) {
-        const enhancedData = extractedData as EnhancedExtractedTaxData;
-        console.log('🔍 Validation data found, performing cross-verification...');
-        return this.validateExtractedData(enhancedData);
+      let extractedData: any;
+      try {
+        extractedData = safeJSONParse(content);
+        console.log('Successfully parsed JSON:', extractedData);
+      } catch (error) {
+        console.warn('All JSON parsing attempts failed, falling back to text extraction');
+        return this.extractFromRawText(originalDocumentText || content);
       }
 
-      // Handle various response formats
+      // Handle different response formats
+      if (!extractedData) {
+        console.warn('No data could be extracted, falling back to text extraction');
+        return this.extractFromRawText(originalDocumentText || content);
+      }
+
+      if ('validationData' in extractedData) {
+        console.log('Processing enhanced data with validation...');
+        return this.validateExtractedData(extractedData as EnhancedExtractedTaxData);
+      }
+
       if ('Balance_Sheet' in extractedData || 'Profit_and_Loss' in extractedData) {
+        console.log('Processing financial statement format...');
         return this.parseFinancialStatementFormat(extractedData as FinancialStatementData, originalDocumentText || content);
       }
 
-      // Handle simplified AI responses (like {"Revenue": 1680, "ProfitBeforeTax": 1680})
       if (this.isSimplifiedResponse(extractedData)) {
+        console.log('Processing simplified response format...');
         return this.parseSimplifiedResponse(extractedData, originalDocumentText || content);
       }
 
-      // If it's already in our expected format, validate and return
-      const taxData = extractedData as ExtractedTaxData & { detailedBreakdown?: any };
-      
-      // If we have detailed breakdown, use those values for more accuracy
-      if (taxData.detailedBreakdown) {
-        console.log('📊 Using detailed breakdown data for enhanced accuracy');
-        const breakdown = taxData.detailedBreakdown;
-        
-        const normalizedData: ExtractedTaxData = {
-          taxpayerName: taxData.taxpayerName || "Not provided",
-          taxYear: taxData.taxYear || new Date().getFullYear(),
-          totalIncome: breakdown.revenue || taxData.totalIncome || 0,
-          totalExpenses: breakdown.generalAdminExpenses || taxData.totalExpenses || 0,
-          totalDeductions: breakdown.capitalAllowances || breakdown.depreciation || taxData.totalDeductions || 0,
-          taxableAmount: breakdown.profitBeforeTax || breakdown.chargeableIncome || taxData.taxableAmount || 0,
-          taxId: taxData.taxId || "Not provided",
-          businessType: taxData.businessType || "Not provided"
-        };
-        
-        console.log('📋 Enhanced extraction with detailed breakdown:', normalizedData);
-        return this.applySoftConstraints(normalizedData);
-      }
-      
-      const normalizedData: ExtractedTaxData = {
-        taxpayerName: taxData.taxpayerName || "Not provided",
-        taxYear: taxData.taxYear || new Date().getFullYear(),
-        totalIncome: typeof taxData.totalIncome === 'number' ? taxData.totalIncome : 0,
-        totalExpenses: typeof taxData.totalExpenses === 'number' ? taxData.totalExpenses : 0,
-        totalDeductions: typeof taxData.totalDeductions === 'number' ? taxData.totalDeductions : 0,
-        taxableAmount: typeof taxData.taxableAmount === 'number' ? taxData.taxableAmount : 0,
-        taxId: taxData.taxId || "Not provided",
-        businessType: taxData.businessType || "Not provided"
-      };
-
-      // Apply soft constraints even to standard format
-      return this.applySoftConstraints(normalizedData);
+      // Standard format
+      console.log('Processing standard format...');
+      return this.processStandardFormat(extractedData, originalDocumentText || content);
     } catch (error) {
       console.error('Failed to parse AI response:', error);
-      console.error('Raw response:', content);
-      
-      // Try additional cleaning for malformed JSON
-      try {
-        console.log('🔧 Attempting additional JSON cleaning...');
-        let rescueContent = content.trim();
-        
-        // More aggressive comment removal
-        rescueContent = rescueContent.replace(/\/\/[^\r\n]*/g, '');
-        rescueContent = rescueContent.replace(/\/\*[\s\S]*?\*\//g, '');
-        
-        // Remove any text before the first { and after the last }
-        const firstBrace = rescueContent.indexOf('{');
-        const lastBrace = rescueContent.lastIndexOf('}');
-        if (firstBrace !== -1 && lastBrace !== -1) {
-          rescueContent = rescueContent.substring(firstBrace, lastBrace + 1);
-        }
-        
-        // Fix common JSON issues
-        rescueContent = rescueContent.replace(/,(\s*[}\]])/g, '$1'); // trailing commas
-        rescueContent = rescueContent.replace(/(['"])?([a-zA-Z0-9_]+)(['"])?:/g, '"$2":'); // unquoted keys
-        
-        console.log('🔧 Rescue JSON attempt:', rescueContent);
-        const rescueData = JSON.parse(rescueContent);
-        console.log('✅ Rescue parsing successful!');
-        
-        // If rescue parsing works, process the data directly
-        if (rescueData && typeof rescueData === 'object') {
-          console.log('✅ Rescue parsing successful! Processing directly...');
-          
-          // Process the rescued data directly without recursion
-          if (this.isSimplifiedResponse(rescueData)) {
-            return this.parseSimplifiedResponse(rescueData, originalDocumentText || content);
-          }
-          
-          // Handle standard format  
-          const normalizedData: ExtractedTaxData = {
-            taxpayerName: (rescueData as any).taxpayerName || "Not provided",
-            taxYear: (rescueData as any).taxYear || new Date().getFullYear(),
-            totalIncome: typeof (rescueData as any).totalIncome === 'number' ? (rescueData as any).totalIncome : 0,
-            totalExpenses: typeof (rescueData as any).totalExpenses === 'number' ? (rescueData as any).totalExpenses : 0,
-            totalDeductions: typeof (rescueData as any).totalDeductions === 'number' ? (rescueData as any).totalDeductions : 0,
-            taxableAmount: typeof (rescueData as any).taxableAmount === 'number' ? (rescueData as any).taxableAmount : 0,
-            taxId: (rescueData as any).taxId || "Not provided",
-            businessType: (rescueData as any).businessType || "Not provided"
-          };
-          
-          return this.applySoftConstraints(normalizedData);
-        }
-      } catch (rescueError) {
-        console.warn('🔧 Rescue parsing also failed:', rescueError);
-      }
-      
-      // If JSON parsing fails completely, extract data directly from the document text
-      console.log('📋 Falling back to direct text extraction...');
-      const { companyName, businessType } = this.extractCompanyDetails(originalDocumentText || content);
-      const taxYear = this.extractTaxYear(originalDocumentText || content);
-      const amounts = this.extractTaxAmounts(originalDocumentText || content);
-
-      return {
-        taxpayerName: companyName,
-        taxYear: taxYear,
-        ...amounts,
-        taxId: "Not provided",
-        businessType: businessType
-      };
+      return this.extractFromRawText(originalDocumentText || content);
     }
+  }
+
+  /**
+   * Extract data directly from text when JSON parsing fails
+   */
+  private extractFromRawText(text: string): ExtractedTaxData {
+    console.log('📋 Extracting data directly from text...');
+    const { name: companyName, type: businessType } = extractCompanyInfo(text);
+    const taxYear = extractYearFromText(text);
+    const amounts = this.extractTaxAmounts(text);
+
+    return {
+      taxpayerName: companyName,
+      taxYear: taxYear,
+      ...amounts,
+      taxId: "Not provided",
+      businessType: businessType
+    };
+  }
+
+  /**
+   * Process standard format response
+   */
+  private processStandardFormat(data: any, originalText: string): ExtractedTaxData {
+    console.log('Processing standard format data...');
+    
+    // Use detailed breakdown if available
+    if (data.detailedBreakdown) {
+      console.log('Using detailed breakdown data...');
+      const breakdown = data.detailedBreakdown;
+      
+      const normalizedData: ExtractedTaxData = {
+        taxpayerName: data.taxpayerName || "Not provided",
+        taxYear: data.taxYear || new Date().getFullYear(),
+        totalIncome: breakdown.revenue || data.totalIncome || 0,
+        totalExpenses: breakdown.generalAdminExpenses || data.totalExpenses || 0,
+        totalDeductions: breakdown.capitalAllowances || breakdown.depreciation || data.totalDeductions || 0,
+        taxableAmount: breakdown.profitBeforeTax || breakdown.chargeableIncome || data.taxableAmount || 0,
+        taxId: data.taxId || "Not provided",
+        businessType: data.businessType || "Not provided"
+      };
+      
+      return this.applySoftConstraints(normalizedData);
+    }
+    
+    // Standard format processing
+    const normalizedData: ExtractedTaxData = {
+      taxpayerName: data.taxpayerName || "Not provided",
+      taxYear: data.taxYear || new Date().getFullYear(),
+      totalIncome: typeof data.totalIncome === 'number' ? data.totalIncome : 0,
+      totalExpenses: typeof data.totalExpenses === 'number' ? data.totalExpenses : 0,
+      totalDeductions: typeof data.totalDeductions === 'number' ? data.totalDeductions : 0,
+      taxableAmount: typeof data.taxableAmount === 'number' ? data.taxableAmount : 0,
+      taxId: data.taxId || "Not provided",
+      businessType: data.businessType || "Not provided"
+    };
+
+    return this.applySoftConstraints(normalizedData);
   }
 
   /**
@@ -1200,89 +1506,6 @@ export class RAGExtractor {
       taxId: 'Not provided',
       businessType: 'Not specified'
     };
-  }
-
-  /**
-   * Get providers to try based on preference
-   */
-  private getProvidersToTry(): string[] {
-    if (this.availableProviders.includes(this.preferredProvider)) {
-      return [
-        this.preferredProvider,
-        ...this.availableProviders.filter(p => p !== this.preferredProvider)
-      ];
-    }
-    return this.availableProviders;
-  }
-
-  /**
-   * Check if AI extraction is enabled
-   */
-  isAIEnabled(): boolean {
-    return this.availableProviders.length > 0;
-  }
-
-  /**
-   * Get available AI providers
-   */
-  getAvailableProviders(): string[] {
-    return this.availableProviders;
-  }
-
-  /**
-   * Test AI provider connections
-   */
-  async testConnection(): Promise<Record<string, boolean>> {
-    const results: Record<string, boolean> = {
-      ollama: false,
-      openai: false,
-      claude: false
-    };
-
-    // Test Ollama
-    if (this.llm) {
-    try {
-        const response = await this.llm.invoke("Test connection");
-        results.ollama = !!response;
-      } catch (error) {
-        console.warn('Ollama test failed:', error);
-      }
-    }
-
-    // Test OpenAI
-    if (this.openai) {
-      try {
-        const response = await this.openai.chat.completions.create({
-          model: config.ai.openai.model,
-          messages: [{ role: 'user', content: 'Test connection' }],
-          max_tokens: 50
-        });
-        results.openai = !!response;
-      } catch (error) {
-        console.warn('OpenAI test failed:', error);
-      }
-    }
-
-    // Test Claude
-    if (this.claude) {
-      try {
-        const response = await this.claude.messages.create({
-          model: config.ai.claude.model,
-          max_tokens: 50,
-          messages: [
-            {
-              role: 'user',
-              content: 'Test connection'
-            }
-          ]
-        });
-        results.claude = !!response;
-    } catch (error) {
-        console.warn('Claude test failed:', error);
-      }
-    }
-
-    return results;
   }
 
   /**
@@ -1402,18 +1625,12 @@ export class RAGExtractor {
    * Build report generation prompt
    */
   private buildReportGenerationPrompt(extractedData: ExtractedTaxData): string {
+   
     return `
       You are a senior financial analyst and tax expert. Based on the following extracted tax data, generate a comprehensive annual financial report. The report should be professional, detailed, and provide meaningful insights for business decision-making.
 
       EXTRACTED TAX DATA:
-      - Company Name: ${extractedData.taxpayerName}
-      - Tax Year: ${extractedData.taxYear}
-      - Total Income: $${extractedData.totalIncome.toLocaleString()}
-      - Total Expenses: $${extractedData.totalExpenses.toLocaleString()}
-      - Total Deductions: $${extractedData.totalDeductions.toLocaleString()}
-      - Taxable Amount: $${extractedData.taxableAmount.toLocaleString()}
-      - Tax ID: ${extractedData.taxId}
-      - Business Type: ${extractedData.businessType}
+       ${JSON.stringify(extractedData, null, 2)}
 
       Please generate a comprehensive annual report that includes:
 
@@ -1441,15 +1658,15 @@ export class RAGExtractor {
          - Growth potential analysis
 
       5. **RECOMMENDATIONS**
-         - Strategic financial recommendations
-         - Tax optimization opportunities
-         - Cost management suggestions
-         - Growth and investment recommendations
+        - Strategic financial recommendations
+        - Tax optimization opportunities
+        - Cost management suggestions
+        - Growth and investment recommendations
 
       6. **CONCLUSION**
          - Overall financial position summary
-         - Key takeaways for stakeholders
-         - Forward-looking statements
+        - Key takeaways for stakeholders
+        - Forward-looking statements
 
       FORMAT REQUIREMENTS:
       - Use clear headings and subheadings
